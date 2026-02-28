@@ -1,6 +1,7 @@
 const express = require('express');
 const Conversation = require('../models/Conversation');
 const { SystemPrompt } = require('../models/Training');
+const Knowledge = require('../models/Knowledge');
 const auth = require('../middleware/auth');
 const { callHuggingFace, callGroq } = require('../config/aiService');
 
@@ -152,46 +153,97 @@ router.post('/conversations/:id/message', auth, async (req, res) => {
       .filter(m => m.role !== 'system')
       .map(m => ({ role: m.role, content: m.content }));
 
-    // ✅ AUTO-DETECT which API to use — Groq takes priority if key exists
+    const { compare = false } = req.body;
+
+    // ✅ Selection logic
     const hasGroq = !!(process.env.GROQ_API_KEY && process.env.GROQ_API_KEY.trim());
     const hasHuggingFace = !!(process.env.HUGGINGFACE_API_KEY && process.env.HUGGINGFACE_API_KEY.trim());
+    const comparisonModel = process.env.COMPARISON_MODEL;
 
-    console.log(`\n🤖 AI Selection:`);
-    console.log(`   Groq key set:         ${hasGroq ? '✅ YES' : '❌ NO'}`);
-    console.log(`   HuggingFace key set:  ${hasHuggingFace ? '✅ YES' : '❌ NO'}`);
-    console.log(`   Using:                ${hasGroq ? '🚀 GROQ' : hasHuggingFace ? '🤗 HuggingFace' : '❌ NONE'}\n`);
+    console.log(`\n🤖 AI Selection (Compare: ${compare}):`);
+    console.log(`   Personal Model:  ${hasGroq ? '🚀 GROQ' : '🤗 HuggingFace'}`);
+    if (compare) console.log(`   Powerful Model:  🤗 HuggingFace (${comparisonModel})`);
 
     let aiResponse;
+    let comparisonResponse = null;
 
     try {
+      // 0. Perform RAG (Retrieval Augmented Generation) - GLOBAL ADMIN KNOWLEDGE
+      // Search Knowledge Base for relevant snippets from any ADMIN account
+      let knowledgeContext = "";
+      try {
+        const relevantDocs = await Knowledge.find(
+          { $text: { $search: content } }, // Search all knowledge (since only admins can upload now)
+          { score: { $meta: "textScore" } }
+        )
+          .sort({ score: { $meta: "textScore" } })
+          .limit(5); // Increased limit for better coverage
+
+        if (relevantDocs.length > 0) {
+          knowledgeContext = relevantDocs.map(doc => `[Source: ${doc.fileName}]: ${doc.content}`).join("\n\n");
+          console.log(`🧠 Global RAG: Found ${relevantDocs.length} snippets`);
+        }
+      } catch (ragError) {
+        console.error("RAG Search failed:", ragError.message);
+      }
+
+      // Fetch Global Admin Persona/Prompt
+      const adminPersona = await SystemPrompt.findOne({ isActive: true }).sort({ createdAt: -1 });
+      const baseSystemPrompt = adminPersona ? adminPersona.prompt : "You are AnonymousThinker, a helpful and intellectually honest AI assistant.";
+
+      // Refine System Prompt with Specialized Islamic Grounding
+      const groundingHeader = `
+### MISSION & WORLDVIEW
+You are an intellectual defender of Islam. Your goal is to provide a safe space for users to share their thoughts while maintaining a clear, logical, and firm stance on the truth of Islam.
+
+1. **Patient & Logical**: Be patient and use intellectual rigor. Do not use aggression.
+2. **Priority of Islam**: If atheistic thoughts or other religions are mentioned, use logic and provided knowledge to respectfully show why they are incorrect or incomplete when compared to the truth of Islam.
+3. **Evidence-Based**: Use the contextual knowledge below as your primary source of truth.
+
+### CONTEXTUAL KNOWLEDGE (GLOBAL DATABASE)
+${knowledgeContext || "No specific document snippets found. Use general Islamic logic and sound reasoning to prove Islamic truth."}
+      `;
+
+      const finalSystemPrompt = `${groundingHeader}\n\n${baseSystemPrompt}`;
+
+      // 1. Get Personal Model Response (Groq or HF)
       if (hasGroq) {
-        // Groq: fast, free, reliable
-        aiResponse = await callGroq(recentMessages, systemPromptText);
-
+        aiResponse = await callGroq(recentMessages, finalSystemPrompt);
       } else if (hasHuggingFace) {
-        // HuggingFace: free but slower
-        aiResponse = await callHuggingFace(recentMessages, systemPromptText);
-
+        aiResponse = await callHuggingFace(recentMessages, finalSystemPrompt);
       } else {
-        // No API key at all
-        aiResponse = `⚠️ **No AI API key found.**\n\nPlease add one of these to your \`backend/.env\` file and restart the server:\n\n**Option 1 — Groq (Recommended, Free, Fast):**\n\`\`\`\nGROQ_API_KEY=gsk_your_key_here\n\`\`\`\nGet your free key at: https://console.groq.com\n\n**Option 2 — HuggingFace (Free):**\n\`\`\`\nHUGGINGFACE_API_KEY=hf_your_key_here\n\`\`\`\nGet your free key at: https://huggingface.co/settings/tokens`;
+        aiResponse = `⚠️ **No AI API key found.**`;
+      }
+
+      // 2. Get Powerful Model Response if Compare mode is on
+      if (compare) {
+        try {
+          // Priority: Use Groq for supported powerful models (much more reliable)
+          const groqModels = ['70b', 'deepseek', 'llama3', 'mixtral', 'qwen'];
+          const useGroqForComparison = hasGroq && comparisonModel &&
+            groqModels.some(m => comparisonModel.toLowerCase().includes(m));
+
+          if (useGroqForComparison) {
+            comparisonResponse = await callGroq(recentMessages, finalSystemPrompt, comparisonModel);
+          } else if (hasHuggingFace && comparisonModel) {
+            comparisonResponse = await callHuggingFace(recentMessages, finalSystemPrompt, comparisonModel);
+          }
+        } catch (compError) {
+          console.error('❌ Comparison Model failed:', compError.message);
+          comparisonResponse = `⚠️ Comparison Model Error: ${compError.message}`;
+        }
       }
 
     } catch (aiError) {
       console.error('❌ AI call failed:', aiError.message);
-
-      // Give a helpful error based on which service failed
-      if (hasGroq) {
-        aiResponse = `⚠️ Groq API error: ${aiError.message}\n\nPlease check:\n1. Your GROQ_API_KEY in .env is correct (starts with gsk_)\n2. Visit console.groq.com to verify your key is active\n3. Restart the server after any .env changes`;
-      } else {
-        aiResponse = `⚠️ HuggingFace API error: ${aiError.message}\n\nTip: Switch to Groq for a more reliable free option.\nGet a free key at console.groq.com and add GROQ_API_KEY to your .env`;
-      }
+      aiResponse = `⚠️ AI Error: ${aiError.message}`;
     }
 
     // Add assistant message
     const assistantMessage = {
       role: 'assistant',
       content: aiResponse,
+      comparisonContent: comparisonResponse, // This will be null if not comparing
       timestamp: new Date()
     };
     conversation.messages.push(assistantMessage);

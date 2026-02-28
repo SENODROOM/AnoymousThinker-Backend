@@ -10,6 +10,10 @@ const messageSchema = new mongoose.Schema({
     type: String,
     required: true
   },
+  comparisonContent: {
+    type: String, // Stores response from the powerful comparison model
+    default: null
+  },
   timestamp: {
     type: Date,
     default: Date.now
@@ -46,13 +50,13 @@ const conversationSchema = new mongoose.Schema({
 });
 
 // Update the updatedAt field on every save
-conversationSchema.pre('save', function(next) {
+conversationSchema.pre('save', function (next) {
   this.updatedAt = new Date();
   next();
 });
 
 // Auto-generate title from first message
-conversationSchema.methods.generateTitle = function() {
+conversationSchema.methods.generateTitle = function () {
   if (this.messages.length > 0) {
     const firstUserMessage = this.messages.find(m => m.role === 'user');
     if (firstUserMessage) {

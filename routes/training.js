@@ -1,8 +1,18 @@
 const express = require('express');
+console.log('--- TRAINING ROUTE FILE LOADED: v1.0.1 ---');
 const { TrainingEntry, SystemPrompt } = require('../models/Training');
+const Knowledge = require('../models/Knowledge');
 const auth = require('../middleware/auth');
+const adminAuth = require('../middleware/adminAuth');
+const multer = require('multer');
+// parsePDF removed from top-level to be required inline for debugging
+
+const upload = multer({ storage: multer.memoryStorage() });
 
 const router = express.Router();
+
+// Apply adminAuth to ALL training routes
+router.use(auth, adminAuth);
 
 // ===== SYSTEM PROMPTS (Persona Training) =====
 
@@ -90,9 +100,9 @@ router.put('/prompts/deactivate-all', auth, async (req, res) => {
 // DELETE /api/training/prompts/:id
 router.delete('/prompts/:id', auth, async (req, res) => {
   try {
-    await SystemPrompt.findOneAndDelete({ 
-      _id: req.params.id, 
-      userId: req.user._id 
+    await SystemPrompt.findOneAndDelete({
+      _id: req.params.id,
+      userId: req.user._id
     });
     res.json({ message: 'Prompt deleted' });
   } catch (error) {
@@ -139,9 +149,9 @@ router.post('/examples', auth, async (req, res) => {
 // DELETE /api/training/examples/:id
 router.delete('/examples/:id', auth, async (req, res) => {
   try {
-    await TrainingEntry.findOneAndDelete({ 
-      _id: req.params.id, 
-      userId: req.user._id 
+    await TrainingEntry.findOneAndDelete({
+      _id: req.params.id,
+      userId: req.user._id
     });
     res.json({ message: 'Example deleted' });
   } catch (error) {
@@ -152,9 +162,9 @@ router.delete('/examples/:id', auth, async (req, res) => {
 // GET /api/training/export - export training data as JSONL (for fine-tuning)
 router.get('/export', auth, async (req, res) => {
   try {
-    const examples = await TrainingEntry.find({ 
+    const examples = await TrainingEntry.find({
       userId: req.user._id,
-      isApproved: true 
+      isApproved: true
     });
 
     // Format as JSONL for Hugging Face fine-tuning
@@ -172,6 +182,132 @@ router.get('/export', auth, async (req, res) => {
     res.send(jsonlString);
   } catch (error) {
     res.status(500).json({ error: 'Failed to export training data' });
+  }
+});
+
+// ===== KNOWLEDGE BASE (PDF/Text RAG) =====
+
+// GET /api/training/knowledge - list all uploaded knowledge
+router.get('/knowledge', auth, async (req, res) => {
+  try {
+    const knowledge = await Knowledge.find({ userId: req.user._id })
+      .select('fileName fileType createdAt')
+      .sort({ createdAt: -1 });
+
+    // Group by filename to show a cleaner list in UI
+    const grouped = knowledge.reduce((acc, curr) => {
+      if (!acc[curr.fileName]) {
+        acc[curr.fileName] = {
+          _id: curr._id,
+          fileName: curr.fileName,
+          fileType: curr.fileType,
+          createdAt: curr.createdAt,
+          chunks: 0
+        };
+      }
+      acc[curr.fileName].chunks++;
+      return acc;
+    }, {});
+
+    res.json(Object.values(grouped));
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch knowledge' });
+  }
+});
+
+// POST /api/training/knowledge/upload - upload PDF/Text and extract snippets
+router.post('/knowledge/upload', auth, upload.single('file'), async (req, res) => {
+  console.log('DEBUG ENTRY: Upload route hit');
+  try {
+    if (!req.file) {
+      console.log('DEBUG: No file in request');
+      return res.status(400).json({ error: 'No file uploaded' });
+    }
+
+    const fileName = req.file.originalname;
+    console.log('DEBUG: Uploading file:', fileName);
+    const fileType = fileName.split('.').pop().toLowerCase();
+    let text = '';
+
+    if (fileType === 'pdf') {
+      try {
+        const pdfParser = require('pdf-parse');
+        console.log('DEBUG-V2: Starting PDF extraction for:', fileName);
+        const data = await pdfParser(req.file.buffer);
+        text = data.text;
+        console.log('DEBUG: Extraction complete. Text length:', text ? text.length : 0);
+      } catch (err) {
+        console.error('PDF Parsing inner error:', err);
+        return res.status(500).json({ error: `PDF Processing failed: ${err.message}` });
+      }
+    } else if (fileType === 'txt') {
+      text = req.file.buffer.toString('utf-8');
+      console.log('DEBUG: TXT read complete. Text length:', text.length);
+    } else {
+      return res.status(400).json({ error: 'Unsupported file type. Please use PDF or TXT.' });
+    }
+
+    if (!text || text.trim().length === 0) {
+      console.log('DEBUG: Extraction resulted in NO text.');
+      return res.status(400).json({ error: 'The file appears to be empty or unreadable.' });
+    }
+
+    // Chunking logic
+    const chunkSize = 1000;
+    const chunks = [];
+    for (let i = 0; i < text.length; i += chunkSize) {
+      const chunk = text.substring(i, i + chunkSize).trim();
+      if (chunk.length > 50) chunks.push(chunk);
+    }
+
+    console.log(`DEBUG: Created ${chunks.length} valid chunks.`);
+
+    if (chunks.length === 0) {
+      return res.status(400).json({ error: 'File too small or no meaningful text found.' });
+    }
+
+    // Save chunks to database
+    console.log('DEBUG: Saving chunks to MongoDB...');
+    const savedKnowledge = await Promise.all(
+      chunks.map(async (content, index) => {
+        try {
+          const entry = new Knowledge({
+            userId: req.user._id,
+            content,
+            fileName,
+            fileType
+          });
+          return await entry.save();
+        } catch (saveErr) {
+          console.error(`DEBUG: Failed to save chunk ${index}:`, saveErr.message);
+          throw saveErr;
+        }
+      })
+    );
+
+    console.log(`DEBUG: Successfully saved ${savedKnowledge.length} chunks.`);
+
+    res.status(201).json({
+      message: `Successfully processed ${fileName}`,
+      chunks: savedKnowledge.length
+    });
+
+  } catch (error) {
+    console.error('Upload Error:', error);
+    res.status(500).json({ error: 'Failed to process file' });
+  }
+});
+
+// DELETE /api/training/knowledge/:filename - delete all chunks of a file
+router.delete('/knowledge/:fileName', auth, async (req, res) => {
+  try {
+    await Knowledge.deleteMany({
+      userId: req.user._id,
+      fileName: req.params.fileName
+    });
+    res.json({ message: 'File and related knowledge removed' });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to delete knowledge' });
   }
 });
 

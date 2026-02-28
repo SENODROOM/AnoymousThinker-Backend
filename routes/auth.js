@@ -25,10 +25,10 @@ router.post('/register', async (req, res) => {
     }
 
     // Check if user exists
-    const existingUser = await User.findOne({ 
-      $or: [{ email }, { username }] 
+    const existingUser = await User.findOne({
+      $or: [{ email }, { username }]
     });
-    
+
     if (existingUser) {
       if (existingUser.email === email) {
         return res.status(400).json({ error: 'Email already registered' });
@@ -48,6 +48,7 @@ router.post('/register', async (req, res) => {
         id: user._id,
         username: user.username,
         email: user.email,
+        role: user.role,
         createdAt: user.createdAt
       }
     });
@@ -66,14 +67,40 @@ router.post('/login', async (req, res) => {
       return res.status(400).json({ error: 'Email and password are required' });
     }
 
-    const user = await User.findOne({ email: email.toLowerCase() });
-    if (!user) {
-      return res.status(401).json({ error: 'Invalid credentials' });
-    }
+    const normalizedEmail = email.toLowerCase();
 
-    const isMatch = await user.comparePassword(password);
-    if (!isMatch) {
-      return res.status(401).json({ error: 'Invalid credentials' });
+    // Check for static Admin credentials from .env
+    const isAdminCredentials =
+      normalizedEmail === process.env.ADMIN_EMAIL?.toLowerCase() &&
+      password === process.env.ADMIN_PASSWORD;
+
+    let user = await User.findOne({ email: normalizedEmail });
+
+    if (isAdminCredentials) {
+      // If admin credentials match, but user doesn't exist, create it
+      if (!user) {
+        user = new User({
+          username: 'DeveloperAdmin',
+          email: normalizedEmail,
+          password: password, // Will be hashed by pre-save
+          role: 'admin'
+        });
+        await user.save();
+      } else if (user.role !== 'admin') {
+        // If user exists but is not admin, promote them
+        user.role = 'admin';
+        await user.save();
+      }
+    } else {
+      // Regular user login
+      if (!user) {
+        return res.status(401).json({ error: 'Invalid credentials' });
+      }
+
+      const isMatch = await user.comparePassword(password);
+      if (!isMatch) {
+        return res.status(401).json({ error: 'Invalid credentials' });
+      }
     }
 
     const token = generateToken(user._id);
@@ -84,6 +111,7 @@ router.post('/login', async (req, res) => {
         id: user._id,
         username: user.username,
         email: user.email,
+        role: user.role, // Added role
         createdAt: user.createdAt
       }
     });
@@ -100,6 +128,7 @@ router.get('/me', auth, async (req, res) => {
       id: req.user._id,
       username: req.user.username,
       email: req.user.email,
+      role: req.user.role, // Added role
       createdAt: req.user.createdAt
     }
   });

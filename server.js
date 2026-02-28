@@ -1,3 +1,4 @@
+// Forced restart to refresh node_modules for pdf-parse 
 const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
@@ -33,5 +34,5 @@ app.get('/api/health', (req, res) => {
 
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
-  console.log(`🚀 AnonymousThinker server running on port ${PORT}`);
+  console.log(`🚀 AnonymousThinker server v1.0.1 (TIMESTAMP: ${new Date().toISOString()}) running on port ${PORT}`);
 });
